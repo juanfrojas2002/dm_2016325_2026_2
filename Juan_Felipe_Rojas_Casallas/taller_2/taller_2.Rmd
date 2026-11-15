@@ -1,0 +1,356 @@
+---
+title: "Taller 2 -- Comparador de Precios (App Web)"
+subtitle: "Categoria 42: Repelentes y control de insectos"
+author: "Juan Felipe Rojas Casallas"
+date: "Mineria de Datos (2016325) -- 2026-2"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+    toc: true
+    toc_depth: 3
+    number_sections: true
+lang: es
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 5)
+library(DBI)
+library(RSQLite)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+```
+
+```{r conexion, include=FALSE}
+con <- dbConnect(SQLite(), "comparador_precios.sqlite")
+```
+
+# Introduccion
+
+Este taller es la continuacion del Taller 1. La idea era tomar el comparador de precios que ya tenia (repelentes e insecticidas en 3 tiendas colombianas) y meterlo en una app web con Shiny para que cualquier persona pueda consultar los precios, filtrar productos y ver graficos interactivos.
+
+La app quedo publicada en: **https://juanfeliperojas.shinyapps.io/comparador-precios/**
+
+Basicamente la app hace lo siguiente:
+
+- Muestra los productos scrapeados con filtros (tienda, marca, precio, etc)
+- Tiene graficos interactivos con highcharter (barras, evolucion, boxplot, precio unitario)
+- Permite actualizar los precios desde la app (boton que corre el scraper)
+- Compara precios entre ejecuciones para ver que subio o bajo
+- Arma una canasta de compras para ver donde sale mas barato
+
+# Fuentes de datos
+
+## Comercios
+
+```{r comercios}
+kable(dbGetQuery(con, "SELECT nombre AS Comercio, url_base AS URL FROM comercios"),
+      caption = "Comercios utilizados")
+```
+
+Son los mismos 3 del Taller 1. Las tres tiendas usan VTEX como plataforma de e-commerce, entonces el scraping se hace consultando la API REST de catalogo que tienen internamente. Cada peticion devuelve hasta 50 productos en JSON.
+
+## Ejecuciones
+
+```{r ejecuciones}
+kable(dbGetQuery(con, "
+  SELECT c.nombre AS Comercio, e.ejecucion_id AS ID,
+    e.fecha_hora_inicio AS 'Fecha', e.n_registros AS Registros, e.estado AS Estado
+  FROM ejecuciones e JOIN comercios c ON e.comercio_id = c.comercio_id
+  ORDER BY e.fecha_hora_inicio"),
+  caption = "Todas las ejecuciones del scraper")
+```
+
+La primera ejecucion es del Taller 1 (9 de octubre). Despues corri el scraper de nuevo en noviembre para tener al menos 2 ejecuciones completas como pide el parcial. A Exito le puse cloudflare y no me dejo scrapear en vivo, entonces para esa segunda tanda use el modo offline (reprocesa los JSON de `raw/`).
+
+## Resumen por tienda
+
+```{r resumen_tiendas}
+kable(dbGetQuery(con, "
+  SELECT c.nombre AS Comercio,
+    COUNT(DISTINCT e.ejecucion_id) AS Ejecuciones,
+    SUM(CASE WHEN e.estado='completa' THEN 1 ELSE 0 END) AS Completas,
+    SUM(e.n_registros) AS 'Total registros'
+  FROM ejecuciones e JOIN comercios c ON e.comercio_id = c.comercio_id
+  GROUP BY c.nombre"),
+  caption = "Resumen de ejecuciones por tienda")
+```
+
+# Base de datos
+
+## Estructura
+
+La base SQLite tiene 4 tablas: `comercios`, `ejecuciones`, `observaciones` y `correcciones`.
+
+```{r tablas}
+for (tbl in c("comercios", "ejecuciones", "correcciones")) {
+  info <- dbGetQuery(con, sprintf("PRAGMA table_info(%s)", tbl))
+  cat("**Tabla:", tbl, "**\n\n")
+  print(kable(info[, c("name", "type")], col.names = c("Campo", "Tipo")))
+  cat("\n")
+}
+```
+
+La tabla **observaciones** tiene `r nrow(dbGetQuery(con, "PRAGMA table_info(observaciones)"))` campos. Los mas importantes son: `comercio_id`, `nombre_producto`, `marca_estandarizada`, `precio`, `contenido_valor`, `contenido_unidad`, `comparable`, `producto_comun_id` y `disponibilidad`. El detalle completo esta en `diccionario_datos.md`.
+
+La tabla `correcciones` es nueva respecto al Taller 1. Ahi se registra cualquier correccion que se haga sobre datos existentes (por ejemplo si un precio estaba mal o una marca estaba escrita diferente).
+
+## Vistas SQL
+
+Hay 3 vistas que simplifican las consultas mas comunes:
+
+- **v_ultimo_precio**: trae el ultimo precio de cada producto por tienda, con el precio unitario calculado (COP/ml o COP/g)
+- **v_cambios_precio**: compara precios entre ejecuciones del mismo producto y calcula la diferencia en COP y %
+- **v_comparables**: los 9 productos que estan en las 3 tiendas, solo con precio valido
+
+```{r vista_ejemplo}
+kable(head(dbGetQuery(con, "
+  SELECT comercio_nombre AS Comercio, nombre_producto AS Producto,
+    marca_estandarizada AS Marca, precio AS Precio,
+    contenido_valor AS Cant, contenido_unidad AS Ud,
+    ROUND(precio_unitario, 1) AS 'COP/Ud'
+  FROM v_ultimo_precio
+  ORDER BY comercio_id, nombre_producto"), 10),
+  caption = "Ejemplo: primeros 10 registros de v_ultimo_precio")
+```
+
+## Validaciones
+
+Antes de insertar datos se valida con `pointblank`:
+
+- Precio mayor a 0 (o NULL si agotado)
+- Campos obligatorios no nulos (nombre, comercio_id, ejecucion_id)
+- Sin duplicados por (comercio, producto, ejecucion)
+- Constraint UNIQUE en la tabla para reforzar
+
+# Productos comparables
+
+Los 9 productos que encontre en las 3 tiendas:
+
+```{r comparables}
+comparables <- dbGetQuery(con, "
+  SELECT DISTINCT producto_comun_id AS ID,
+    nombre_estandarizado AS Producto,
+    contenido_valor || ' ' || contenido_unidad AS Contenido
+  FROM observaciones
+  WHERE comparable = 1 AND nombre_estandarizado IS NOT NULL
+  ORDER BY producto_comun_id")
+kable(comparables, caption = "Productos comparables (en las 3 tiendas)")
+```
+
+La clasificacion se hace dentro de `scraper.R` con reglas por marca + palabras clave + rango de contenido. Cada tienda le pone nombres distintos al mismo producto, por ejemplo el Stay Off Spray Adulto en una dice "REPELENTE STAY OFF ADULTOS SPRAY" y en otra "Stay Off Spray Adulto 120 ML".
+
+# Consultas y hallazgos
+
+## Precios actuales de comparables
+
+```{r precios_comp}
+precios <- dbGetQuery(con, "
+  SELECT v.nombre_estandarizado AS Producto,
+    c.nombre AS Comercio, v.precio AS Precio
+  FROM v_comparables v
+  JOIN comercios c ON v.comercio_id = c.comercio_id
+  ORDER BY v.nombre_estandarizado, c.nombre")
+kable(precios, caption = "Precios de los productos comparables por tienda")
+```
+
+## Quien es mas barato
+
+```{r mas_barato}
+kable(dbGetQuery(con, "
+  SELECT nombre_estandarizado AS Producto,
+    MIN(precio) AS Minimo, MAX(precio) AS Maximo,
+    MAX(precio) - MIN(precio) AS 'Diferencia COP',
+    ROUND(100.0 * (MAX(precio) - MIN(precio)) / MAX(precio), 1) AS 'Ahorro %'
+  FROM v_comparables
+  GROUP BY nombre_estandarizado
+  ORDER BY 5 DESC"),
+  caption = "Rango de precios y ahorro posible por producto")
+```
+
+Exito sigue siendo el mas barato en la mayoria de productos. La diferencia mas grande sigue en el Stay Off Spray Adulto, donde el ahorro puede ser de mas de 35% si se compra en Exito en vez de La Rebaja.
+
+## Cambios de precio entre ejecuciones
+
+```{r cambios}
+cambios <- dbGetQuery(con, "
+  SELECT comercio_nombre AS Comercio, nombre_producto AS Producto,
+    precio_anterior AS Antes, precio_nuevo AS Despues,
+    diferencia_cop AS 'Dif COP', diferencia_pct AS 'Dif %'
+  FROM v_cambios_precio WHERE diferencia_cop <> 0
+  ORDER BY ABS(diferencia_pct) DESC")
+if (nrow(cambios) > 0) {
+  kable(head(cambios, 15),
+        caption = "Productos con cambios de precio entre ejecuciones")
+} else {
+  cat("No se detectaron cambios de precio entre las ejecuciones (los precios se mantuvieron iguales).\n")
+}
+```
+
+## Precio por unidad de contenido
+
+```{r ppu}
+kable(dbGetQuery(con, "
+  SELECT nombre_estandarizado AS Producto, c.nombre AS Comercio,
+    precio AS Precio, contenido_valor AS Cant, contenido_unidad AS Unidad,
+    ROUND(precio / NULLIF(contenido_valor, 0), 1) AS 'COP/Unidad'
+  FROM v_comparables v
+  JOIN comercios c ON v.comercio_id = c.comercio_id
+  WHERE contenido_valor > 0 AND contenido_unidad != 'unidad'
+  ORDER BY contenido_unidad, nombre_estandarizado, 6"),
+  caption = "Precio por unidad de contenido (COP/ml o COP/g)")
+```
+
+La Autan Crema Family de 200g sale como la que tiene menor costo por gramo, a pesar de que no es la mas barata en precio absoluto. Es porque trae mas cantidad.
+
+## Indicadores generales
+
+```{r indicadores}
+kable(dbGetQuery(con, "
+  SELECT
+    COUNT(DISTINCT producto_id_comercio || comercio_id) AS 'Productos unicos',
+    COUNT(*) AS 'Total observaciones',
+    COUNT(DISTINCT comercio_id) AS Comercios,
+    SUM(CASE WHEN comparable=1 THEN 1 ELSE 0 END) AS 'Obs. comparables',
+    SUM(CASE WHEN es_promocion=1 THEN 1 ELSE 0 END) AS 'En promocion'
+  FROM observaciones"),
+  caption = "Resumen de la base de datos")
+```
+
+# Visualizaciones
+
+## Precios comparados
+
+```{r graf1, fig.cap="Precios de los 9 comparables por tienda"}
+colores <- c("Exito" = "#FDDA24", "Jumbo Colombia" = "#E31937",
+             "La Rebaja Virtual" = "#00A651")
+
+viz <- dbGetQuery(con, "
+  SELECT v.nombre_estandarizado AS producto, c.nombre AS comercio, v.precio
+  FROM v_comparables v
+  JOIN comercios c ON v.comercio_id = c.comercio_id")
+
+ggplot(viz, aes(x = reorder(producto, precio), y = precio, fill = comercio)) +
+  geom_col(position = "dodge", width = 0.7) + coord_flip() +
+  scale_y_continuous(labels = function(x) paste0("$", format(x, big.mark = ","))) +
+  scale_fill_manual(values = colores) +
+  labs(title = "Precios por producto y comercio", x = NULL,
+       y = "Precio (COP)", fill = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+Se nota que La Rebaja (verde) casi siempre es la mas cara. Exito y Jumbo pelean por el precio mas bajo dependiendo del producto.
+
+## Ahorro porcentual
+
+```{r graf2, fig.cap="Cuanto se ahorra comprando en el mas barato"}
+ahorro <- dbGetQuery(con, "
+  SELECT nombre_estandarizado AS producto,
+    ROUND(100.0 * (MAX(precio) - MIN(precio)) / MAX(precio), 1) AS pct
+  FROM v_comparables GROUP BY nombre_estandarizado ORDER BY pct DESC")
+
+ggplot(ahorro, aes(x = reorder(producto, pct), y = pct)) +
+  geom_col(fill = "#2E86AB", width = 0.7) +
+  geom_text(aes(label = paste0(pct, "%")), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  labs(title = "Ahorro al elegir el comercio mas barato",
+       x = NULL, y = "Ahorro (%)") +
+  theme_minimal() + expand_limits(y = max(ahorro$pct) * 1.15)
+```
+
+El Stay Off Adulto y la Autan Crema son los que mas valen la pena comparar. En Nopikex Barra o Bacterion Kids la diferencia no es mucha.
+
+## Precio por mililitro
+
+```{r graf3, fig.cap="Costo por mL en productos liquidos"}
+ppu <- dbGetQuery(con, "
+  SELECT v.nombre_estandarizado AS producto, c.nombre AS comercio,
+    ROUND(precio / NULLIF(contenido_valor,0), 1) AS cop_ml
+  FROM v_comparables v
+  JOIN comercios c ON v.comercio_id = c.comercio_id
+  WHERE contenido_valor > 0 AND contenido_unidad = 'ml'")
+
+ggplot(ppu, aes(x = reorder(producto, cop_ml), y = cop_ml, fill = comercio)) +
+  geom_col(position = "dodge", width = 0.7) + coord_flip() +
+  scale_fill_manual(values = colores) +
+  labs(title = "Precio por mililitro", x = NULL,
+       y = "COP/mL", fill = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+Los sprays son mas caros por mL que los liquidos. Y en general Exito tiene el menor costo por mL.
+
+## Distribucion de precios por tienda
+
+```{r graf4, fig.cap="Distribucion de precios de todos los productos por tienda"}
+todos <- dbGetQuery(con, "
+  SELECT c.nombre AS comercio, o.precio
+  FROM observaciones o
+  JOIN comercios c ON o.comercio_id = c.comercio_id
+  WHERE o.precio IS NOT NULL AND o.precio > 0")
+
+ggplot(todos, aes(x = comercio, y = precio, fill = comercio)) +
+  geom_boxplot(alpha = 0.7) +
+  scale_y_continuous(labels = function(x) paste0("$", format(x, big.mark = ","))) +
+  scale_fill_manual(values = colores) +
+  labs(title = "Distribucion de precios por comercio",
+       x = NULL, y = "Precio (COP)") +
+  theme_minimal() + theme(legend.position = "none")
+```
+
+Exito tiene la distribucion mas dispersa porque incluye muchos insecticidas de hogar que son mas caros. La Rebaja esta mas concentrada porque solo tiene repelentes personales.
+
+# La app web
+
+La app esta hecha con Shiny y `bslib` para el layout. Las librerias principales:
+
+- **bslib**: layout tipo sidebar + navset
+- **highcharter**: graficos interactivos (barras, lineas, boxplot)
+- **DT**: tablas con busqueda, ordenamiento y descarga CSV
+- **httr2**: peticiones HTTP al API de las tiendas
+- **DBI + RSQLite**: acceso a la base SQLite
+- **pointblank**: validacion de datos
+- **promises + future**: para que el scraping no bloquee la app (ExtendedTask)
+
+## Funcionalidades
+
+1. **Filtros en sidebar**: comercio, marca, subcategoria, rango de precios, ejecucion, solo promociones, solo comparables, busqueda por texto
+2. **Indicadores**: total productos, observaciones, ultima ejecucion, % promocion, mediana precio, ahorro maximo
+3. **Graficos**: comparacion de precios, ahorro porcentual, evolucion de precio, boxplot, precio unitario
+4. **Tabla de productos**: con toda la info, ordenable, buscable, descargable en CSV
+5. **Cambios de precio**: compara 2 ejecuciones, muestra que subio/bajo en COP y %
+6. **Canasta de compras**: se eligen productos y cantidades, calcula el costo por tienda y el minimo comprando en la mas barata de cada uno
+7. **Actualizacion**: boton que corre el scraper en background, no bloquea la app, tiene modo offline
+
+## Seguridad
+
+- Sin credenciales en el repo (`.Renviron` en `.gitignore`)
+- Todas las consultas SQL son parametrizadas (nunca se concatena texto del usuario)
+- Validacion de campos de texto (longitud max 200, caracteres peligrosos)
+- User-agent identificado y pausas entre peticiones en el scraper
+
+# Limitaciones
+
+- Exito bloquea con Cloudflare de vez en cuando, asi que el scraping en vivo no siempre funciona. Por eso la app tiene modo offline.
+- Los precios cambian a cada rato, lo que esta en la base es una foto del momento en que se corrio el scraper.
+- El plan gratuito de shinyapps.io apaga la app despues de un rato de inactividad, puede tardar en cargar la primera vez.
+- Solo compare repelentes e insecticidas. Para otras categorias habria que modificar las categorias en `scraper.R`.
+
+# Conclusiones
+
+1. **Exito casi siempre gana en precio**. De los 9 productos comparables, en 5 o 6 tiene el menor precio. El ahorro puede llegar al 37% en el Stay Off Spray Adulto.
+
+2. **La Rebaja es la mas cara** pero tiene sentido porque es drogueria. Los precios estan entre 15-20% por encima. Solo en Nopikex Liquido es mas barata.
+
+3. **El precio por gramo/ml cambia la perspectiva**. La Autan Crema Family 200g sale como la mejor opcion por gramo entre los repelentes corporales, aunque no sea la mas barata de precio.
+
+4. **Entre las dos ejecuciones no hubo cambios grandes de precio**, lo cual sugiere que estos productos tienen precios bastante estables (al menos en el rango de un mes).
+
+# Uso de IA
+
+Use Claude para ayudarme con la estructura general del proyecto y algunas consultas SQL que me costaban. Despues revise los JSON crudos a mano para que los datos cuadraran y probe la app completa antes de entregar.
+
+```{r cerrar, include=FALSE}
+dbDisconnect(con)
+```
